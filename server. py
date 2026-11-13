@@ -1,0 +1,334 @@
+# -*- coding: utf-8 -*-
+"""
+PROFISORE OMEGA — Single File
+Run modes:
+  - Local bot:      python omega.py
+  - Render server:  gunicorn omega:app
+"""
+import os
+import sys
+import json
+import time
+import uuid
+import datetime
+import subprocess
+import threading
+import requests
+
+# ==================== AUTO-INSTALL ====================
+def _ensure(pkg, name=None):
+    name = name or pkg
+    try:
+        __import__(name)
+    except ImportError:
+        print(f"📦 installing {pkg}...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", pkg], check=False)
+
+for _p, _n in [("requests", "requests"), ("flask", "flask"),
+               ("pillow", "PIL"), ("gunicorn", "gunicorn")]:
+    try:
+        _ensure(_p, _n)
+    except Exception:
+        pass
+
+from flask import Flask, render_template_string, request, abort
+
+# ==================== TOOLS ====================
+HOME = os.path.expanduser("~")
+
+def run_eyes(email: str) -> str:
+    path = os.path.join(HOME, "Eyes", "eyes.py")
+    if not os.path.exists(path):
+        return ("⚠️ أداة Eyes غير مثبتة.\n\n"
+                "للتثبيت على جهازك:\n"
+                "git clone https://github.com/N0rz3/Eyes.git ~/Eyes\n"
+                "cd ~/Eyes && pip install -r requirements.txt")
+    try:
+        out = subprocess.run([sys.executable, path, email],
+                             capture_output=True, text=True, timeout=300)
+        return (out.stdout or "") + (out.stderr or "") or "لا توجد نتائج."
+    except subprocess.TimeoutExpired:
+        return "⏱️ انتهت المهلة."
+    except Exception as e:
+        return f"❌ خطأ: {e}"
+
+def run_phone(number: str) -> str:
+    path = os.path.join(HOME, "PhoneInfoga", "phoneinfoga.py")
+    if not os.path.exists(path):
+        return ("⚠️ PhoneInfoga غير مثبتة.\n\n"
+                "git clone https://github.com/sundowndev/PhoneInfoga ~/PhoneInfoga\n"
+                "cd ~/PhoneInfoga && pip install -r requirements.txt")
+    try:
+        out = subprocess.run([sys.executable, path, "-n", number],
+                             capture_output=True, text=True, timeout=300)
+        return (out.stdout or "") + (out.stderr or "") or "لا توجد نتائج."
+    except subprocess.TimeoutExpired:
+        return "⏱️ انتهت المهلة."
+    except Exception as e:
+        return f"❌ خطأ: {e}"
+
+def run_image(image_path: str) -> dict:
+    try:
+        from PIL import Image
+        from PIL.ExifTags import TAGS, GPSTAGS
+    except ImportError:
+        return {"error": "Pillow not installed"}
+
+    result = {"exif": {}, "gps": None, "error": None}
+    try:
+        img = Image.open(image_path)
+        exif = img._getexif() or {}
+        gps = {}
+        for tag, val in exif.items():
+            name = TAGS.get(tag, tag)
+            if name == "GPSInfo":
+                for k, v in val.items():
+                    gps[GPSTAGS.get(k, k)] = v
+                continue
+            if isinstance(val, (int, float, str)):
+                result["exif"][str(name)] = str(val)
+        if gps.get("GPSLatitude") and gps.get("GPSLongitude"):
+            def to_deg(v):
+                d, m, s = v
+                return float(d) + float(m) / 60 + float(s) / 3600
+            lat = to_deg(gps["GPSLatitude"]) * (-1 if gps.get("GPSLatitudeRef") == "S" else 1)
+            lon = to_deg(gps["GPSLongitude"]) * (-1 if gps.get("GPSLongitudeRef") == "W" else 1)
+            result["gps"] = {"lat": lat, "lon": lon}
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
+# ==================== FLASK APP ====================
+app = Flask(__name__)
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+BASE_HTML = """
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} — PROFISORE OMEGA</title>
+<style>
+  body { font-family: system-ui, Tahoma; background: #0a0e1a; color: #e0e6f0; padding: 20px; line-height: 1.6; }
+  .container { max-width: 900px; margin: 0 auto; }
+  h1 { text-align: center; color: #4a9eff; }
+  .card { background: #111827; border: 1px solid #1e2a45; border-radius: 12px; padding: 24px; margin-bottom: 20px; }
+  pre { background: #0a0e1a; padding: 16px; overflow-x: auto; font-size: 0.85em; color: #a5d6ff; white-space: pre-wrap; word-break: break-all; border-radius: 8px; }
+  .btn { background: #4a9eff; color: white; padding: 10px 20px; border-radius: 8px; text-decoration: none; display: inline-block; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🐧 PROFISORE OMEGA</h1>
+  {{ content|safe }}
+  <div style="text-align:center; margin-top:30px; color:#6b7c99; font-size:0.8em;">{{ timestamp }}</div>
+</div>
+</body>
+</html>
+"""
+
+def _render(title, content):
+    return render_template_string(
+        BASE_HTML, title=title, content=content,
+        timestamp=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    )
+
+@app.route("/")
+def _home():
+    return _render("الرئيسية",
+        '<div class="card"><h2>أهلاً بك</h2>'
+        '<p>هذا السيرفر الخلفي للبوت. استخدم البوت على تلغرام لطلب النتائج.</p></div>')
+
+@app.route("/result/<rid>")
+def _result(rid):
+    path = os.path.join(RESULTS_DIR, f"{rid}.json")
+    if not os.path.exists(path):
+        abort(404)
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return _render("النتيجة", f"""
+    <div class="card">
+      <h2>📊 نتيجة {data.get('tool')}</h2>
+      <p>🎯 الهدف: <code>{data.get('target')}</code></p>
+      <pre>{data.get('output')}</pre>
+      <a href="/" class="btn">🏠 الرئيسية</a>
+    </div>""")
+
+@app.route("/api/save", methods=["POST"])
+def _api_save():
+    data = request.json or {}
+    rid = uuid.uuid4().hex[:12]
+    with open(os.path.join(RESULTS_DIR, f"{rid}.json"), "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return {"id": rid, "url": f"/result/{rid}"}
+
+@app.route("/api/image", methods=["POST"])
+def _api_image():
+    if "file" not in request.files:
+        return {"error": "no file"}, 400
+    f = request.files["file"]
+    tmp = os.path.join(RESULTS_DIR, f"tmp_{uuid.uuid4().hex}.jpg")
+    f.save(tmp)
+    try:
+        return run_image(tmp)
+    finally:
+        try: os.remove(tmp)
+        except OSError: pass
+
+
+# ==================== TELEGRAM BOT ====================
+BOT_TOKEN = None
+ALLOWED_ID = None
+SERVER_URL = "https://your-app.onrender.com"
+TG_API = "https://api.telegram.org/bot{}/{}"
+STATE = {}
+
+def tg(method, **params):
+    try:
+        r = requests.post(TG_API.format(BOT_TOKEN, method), json=params, timeout=40)
+        return r.json()
+    except Exception:
+        return {"ok": False}
+
+def _send(cid, text, kb=None):
+    return tg("sendMessage", chat_id=cid, text=text, parse_mode="Markdown", reply_markup=kb)
+
+def _edit(cid, mid, text, kb=None):
+    return tg("editMessageText", chat_id=cid, message_id=mid, text=text, parse_mode="Markdown", reply_markup=kb)
+
+def _answer(cb):
+    return tg("answerCallbackQuery", callback_query_id=cb)
+
+def _main_kb():
+    return {"inline_keyboard": [
+        [{"text": "👀 Eyes OSINT", "callback_data": "eyes"},
+         {"text": "📱 PhoneInfoga", "callback_data": "phone"}],
+        [{"text": "🖼️ Image Info", "callback_data": "image"},
+         {"text": "🆘 مساعدة", "callback_data": "help"}],
+        [{"text": "🌐 فتح الموقع", "url": SERVER_URL}],
+    ]}
+
+def _back_kb():
+    return {"inline_keyboard": [[{"text": "🔙 رجوع", "callback_data": "back"}]]}
+
+def _save_link(data):
+    try:
+        r = requests.post(f"{SERVER_URL}/api/save", json=data, timeout=10)
+        if r.ok:
+            return SERVER_URL + r.json()["url"]
+    except Exception:
+        pass
+    return None
+
+def _handle(update):
+    if "message" in update:
+        msg = update["message"]
+        cid = msg["chat"]["id"]
+        uid = msg.get("from", {}).get("id")
+        text = msg.get("text", "")
+        if ALLOWED_ID and uid != ALLOWED_ID and cid != ALLOWED_ID:
+            _send(cid, "🚫 البوت خاص.")
+            return
+        if text.startswith("/start"):
+            STATE.pop(uid, None)
+            _send(cid, "👋 أهلاً!\nاختر من الأزرار:", _main_kb())
+            return
+        st = STATE.get(uid)
+        if st == "eyes" and text:
+            _send(cid, "🔎 جاري الفحص...")
+            out = run_eyes(text)
+            link = _save_link({"tool": "Eyes", "target": text, "output": out})
+            _send(cid, f"✅ النتيجة:\n{link}" if link else f"```\n{out[:3000]}\n```")
+            STATE.pop(uid, None)
+        elif st == "phone" and text:
+            _send(cid, "📱 جاري التحليل...")
+            out = run_phone(text)
+            link = _save_link({"tool": "Phone", "target": text, "output": out})
+            _send(cid, f"✅ النتيجة:\n{link}" if link else f"```\n{out[:3000]}\n```")
+            STATE.pop(uid, None)
+        elif st == "image" and ("document" in msg or "photo" in msg):
+            _send(cid, "🖼️ جاري المعالجة...")
+            file_id = (msg["document"]["file_id"] if "document" in msg
+                       else msg["photo"][-1]["file_id"])
+            info = tg("getFile", file_id=file_id)
+            if info.get("ok"):
+                url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{info['result']['file_path']}"
+                r = requests.get(url, timeout=60)
+                resp = requests.post(f"{SERVER_URL}/api/image",
+                                     files={"file": ("img.jpg", r.content)}, timeout=180)
+                out = json.dumps(resp.json(), ensure_ascii=False, indent=2)
+                link = _save_link({"tool": "Image EXIF", "target": "صورة", "output": out})
+                _send(cid, f"✅ النتيجة:\n{link}" if link else f"```\n{out[:3000]}\n```")
+            else:
+                _send(cid, "❌ تعذّر تحميل الصورة.")
+            STATE.pop(uid, None)
+        else:
+            _send(cid, "استخدم /start.")
+    elif "callback_query" in update:
+        cb = update["callback_query"]
+        cid = cb["message"]["chat"]["id"]
+        mid = cb["message"]["message_id"]
+        uid = cb["from"]["id"]
+        data = cb.get("data", "")
+        _answer(cb["id"])
+        if data == "eyes":
+            STATE[uid] = "eyes"; _edit(cid, mid, "أرسل الإيميل:", _back_kb())
+        elif data == "phone":
+            STATE[uid] = "phone"; _edit(cid, mid, "أرسل الرقم:", _back_kb())
+        elif data == "image":
+            STATE[uid] = "image"; _edit(cid, mid, "أرسل الصورة كملف (Document):", _back_kb())
+        elif data == "help":
+            _edit(cid, mid, "🆘 استخدم الأزرار للبدء.", _back_kb())
+        elif data == "back":
+            STATE.pop(uid, None); _edit(cid, mid, "اختر:", _main_kb())
+
+def run_bot():
+    global BOT_TOKEN, ALLOWED_ID, SERVER_URL
+    print("🐧 PROFISORE OMEGA BOT")
+    BOT_TOKEN = input("🔑 ضع التوكن: ").strip()
+    if not BOT_TOKEN:
+        return
+    me = tg("getMe")
+    if not me.get("ok"):
+        print(f"❌ توكن خاطئ: {me.get('description')}")
+        return
+    print(f"✅ @{me['result']['username']}")
+
+    cid = input("🆔 ضع ID (اختياري - Enter): ").strip()
+    if cid.isdigit():
+        ALLOWED_ID = int(cid)
+
+    url = input(f"🌐 رابط Render [{SERVER_URL}]: ").strip()
+    if url:
+        SERVER_URL = url.rstrip("/")
+
+    print("🚀 يعمل الآن... (Ctrl+C للإيقاف)\n")
+    offset = None
+    while True:
+        try:
+            params = {"timeout": 30, "allowed_updates": ["message", "callback_query"]}
+            if offset:
+                params["offset"] = offset
+            r = tg("getUpdates", **params)
+            if r.get("ok"):
+                for u in r.get("result", []):
+                    offset = u["update_id"] + 1
+                    try:
+                        _handle(u)
+                    except Exception as e:
+                        print(f"⚠️ {e}")
+            else:
+                time.sleep(2)
+        except KeyboardInterrupt:
+            print("\n👋 إيقاف.")
+            return
+        except Exception:
+            time.sleep(3)
+
+
+# ==================== ENTRY POINT ====================
+if __name__ == "__main__":
+    run_bot()
